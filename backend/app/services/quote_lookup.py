@@ -32,6 +32,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.verification import ClosestMiss, DiffOp, QuoteMatch, QuoteVerdict
+from app.services.canon_class import CANON_ORDER_SCRIPT, canon_class
 from app.services.quote_verifier import (
     MIN_QUOTE_CHARS,
     NEAR_MISS_THRESHOLD,
@@ -51,6 +52,10 @@ logger = logging.getLogger(__name__)
 _MAX_CANDIDATES = 5
 # Fuzzy fallback candidates when the phrase query finds nothing.
 _MAX_FUZZY_CANDIDATES = 3
+# Open-world phrase pass, canon-ordered: look past the first five so the
+# confirm loop still reaches five verbatim sources when a few candidates are
+# phrase-hits but not normalised-substring hits (punctuation-free subfield).
+_CANON_ORDER_CANDIDATES = 10
 # Full-text-scan ceiling: scanning every juan of a hinted text is allowed
 # only under this fascicle count (T0220 has 600 juans of ~100k chars — a
 # blind full scan there is a several-hundred-MB read).
@@ -85,6 +90,12 @@ _SHORT_QUOTE_CAVEAT = (
 # Loose shape check for a bare cbeta-style work id (T0374, X0600, SC-mn10,
 # 84K-toh123…). Resolution against buddhist_texts is the real validator.
 _CBETA_HINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,30}$")
+
+
+class SearchUnavailableError(RuntimeError):
+    """Elasticsearch could not be queried. Raised only in ``strict`` mode: the
+    human-facing /verify page must answer "try again", never「大藏经中未见」,
+    when the search itself failed."""
 
 
 class QuoteTooShortError(ValueError):
@@ -274,31 +285,63 @@ async def _es_candidates(
     text_id: int | None,
     phrase: bool,
     size: int,
+    canonical_order: bool = False,
+    strict: bool = False,
 ) -> list[dict]:
     """Candidate fascicles from ES. ``phrase=True`` is the precise pass
     (cjk_content analyzer makes match_phrase ≈ normalised-substring recall);
     ``phrase=False`` is the fuzzy fallback used only to find *closest* text
     for a near-miss verdict."""
-    query_type = "match_phrase" if phrase else "match"
-    content_query: dict = {
-        query_type: {"content": {"query": quote, "analyzer": "cjk_content"}}
-    }
+    if phrase:
+        # Two phrase routes, either suffices:
+        # - content.nopunct drops punctuation/line breaks between Han
+        #   characters at index time, so CBETA's 「如夢、幻、泡、影」 and a user's
+        #   own commas stop deciding whether the candidate is even returned
+        #   (see backend/scripts/es_text_contents_join_wraps.py). No explicit
+        #   analyzer: an index that predates the subfield has no cjk_nopunct
+        #   and would 400 the whole search; an unmapped field just matches
+        #   nothing and the plain route still answers.
+        # - content is the original field (hard wraps joined once the index
+        #   is rebuilt).
+        content_query: dict = {
+            "bool": {
+                "should": [
+                    {"match_phrase": {"content.nopunct": {"query": quote}}},
+                    {"match_phrase": {"content": {"query": quote, "analyzer": "cjk_content"}}},
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+    else:
+        content_query = {"match": {"content": {"query": quote, "analyzer": "cjk_content"}}}
     filters: list[dict] = [{"term": {"lang": "lzh"}}]
     if text_id is not None:
         filters.append({"term": {"text_id": text_id}})
-    body = {
+    body: dict = {
         "query": {"bool": {"must": [content_query], "filter": filters}},
         "size": size,
         "_source": ["text_id", "cbeta_id", "title_zh", "juan_num"],
     }
+    if canonical_order:
+        # Earliest-in-canon first instead of BM25: commentaries quote a famous
+        # line many times and outscore the sutra itself. See canon_class.py.
+        body["sort"] = [
+            {"_script": {"type": "number", "script": {"source": CANON_ORDER_SCRIPT}, "order": "asc"}}
+        ]
+        # One fascicle per text: otherwise a long sūtra that repeats the line
+        # (大般若經's many fascicles) fills every slot and the other texts that
+        # also have it — the 心經 for 色即是空 — never surface.
+        body["collapse"] = {"field": "text_id"}
     try:
         resp = await es.search(index="text_contents", body=body)
         # elasticsearch-py 8.x returns ObjectApiResponse (Mapping-like, NOT a
         # dict) — subscript it; an isinstance(resp, dict) guard silently
         # discards every real result while passing dict-based test doubles.
         hits = resp["hits"]["hits"]
-    except Exception:  # pragma: no cover - ES outage degrades, not crashes
+    except Exception as exc:  # ES outage degrades (agents) or errors (strict)
         logger.warning("verify_quote ES candidate search failed", exc_info=True)
+        if strict:
+            raise SearchUnavailableError(str(exc)) from exc
         return []
     out = []
     for h in hits:
@@ -320,6 +363,7 @@ def _match_from(
         urn=build_urn(src.get("cbeta_id"), juan_num),
         reader_url=absolute_reader_url(reader_path(src["text_id"], juan_num)),
         juan_matched=(juan_num == hinted_juan) if hinted_juan is not None else None,
+        canon_class=canon_class(src.get("cbeta_id")),
     )
 
 
@@ -330,8 +374,12 @@ async def verify_quote(
     *,
     cite: str | None = None,
     juan: int | None = None,
+    strict: bool = False,
 ) -> QuoteVerdict:
-    """Open-world verbatim check of ``quote`` against the corpus."""
+    """Open-world verbatim check of ``quote`` against the corpus.
+
+    ``strict``: raise SearchUnavailableError when ES fails instead of
+    degrading to "nothing found" (the agent-facing API keeps degrading)."""
     needle = normalise_for_match(quote)
     if len(needle) < MIN_LOOKUP_QUOTE_CHARS:
         raise QuoteTooShortError(
@@ -379,7 +427,7 @@ async def verify_quote(
             # ES narrows within the hinted text (finds hits in other juans —
             # reported honestly as juan_matched=False when a juan was hinted).
             cands = await _es_candidates(
-                es, quote, text_id=target.text_id, phrase=True, size=_MAX_CANDIDATES
+                es, quote, text_id=target.text_id, phrase=True, size=_MAX_CANDIDATES, strict=strict
             )
             for src in cands:
                 if src["juan_num"] != target.juan:
@@ -412,7 +460,7 @@ async def verify_quote(
         # Open-world pass (also runs when a cite hint resolved but missed —
         # "not where you said, but it IS here" is the useful answer).
         for src in await _es_candidates(
-            es, quote, text_id=None, phrase=True, size=_MAX_CANDIDATES
+            es, quote, text_id=None, phrase=True, size=_CANON_ORDER_CANDIDATES, canonical_order=True, strict=strict
         ):
             if len(matches) >= _MAX_CANDIDATES:
                 break
@@ -422,7 +470,7 @@ async def verify_quote(
         # Nothing phrase-exact anywhere: fuzzy fallback purely to locate the
         # closest text for the near_miss/absent verdict.
         for src in await _es_candidates(
-            es, quote, text_id=None, phrase=False, size=_MAX_FUZZY_CANDIDATES
+            es, quote, text_id=None, phrase=False, size=_MAX_FUZZY_CANDIDATES, strict=strict
         ):
             await _confirm(src)
 
@@ -437,7 +485,7 @@ async def verify_quote(
             ratio, text_id, juan_num, window = best_miss
             meta = (
                 await db.execute(
-                    sql_text("SELECT cbeta_id FROM buddhist_texts WHERE id = :t"),
+                    sql_text("SELECT cbeta_id, title_zh FROM buddhist_texts WHERE id = :t"),
                     {"t": text_id},
                 )
             ).fetchone()
@@ -449,6 +497,9 @@ async def verify_quote(
                 similarity=round(ratio, 4),
                 window_normalised=window,
                 diff=diff_ops(needle, window),
+                cbeta_id=meta[0] if meta else None,
+                title_zh=meta[1] if meta else None,
+                canon_class=canon_class(meta[0] if meta else None),
             )
 
     cite_matched: bool | None = None
