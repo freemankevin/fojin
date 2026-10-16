@@ -107,9 +107,21 @@ Prometheus 量的是系统；下面这四个数量的是产品。定位（2026-0
 | `citation_click` | 点答案里的内联引文，或宽屏引文边栏里的一条引文，或内联引文悬停卡片里的「打开原文」 | `text_id`；`via`=`inline`（答案正文）/`panel`（边栏）/`preview`（悬停卡片）。缺 `via` 的是边栏上线前的旧事件，等同 inline |
 | `citation_preview_show` | 桌面（`hover: hover`）鼠标停在内联引文上约 300ms、或键盘 Tab 聚焦到内联引文时弹出预览卡片 | `text_id`；`checked`=1/0（该引句是否在 `trust_status.checked_quotes` 里）。每次悬停最多一次——鼠标在引文与卡片之间来回不重复记；触屏不弹也不记 |
 | `citation_preview_open` | 预览卡片里点「打开原文」 | `text_id`。同时另记一条 `citation_click`（`via=preview`），核对率口径不受影响 |
-| `source_click` | 点「参考经文」chip / 等待期 chip / 边栏里的参考经文 | `phase=retrieved` 是等答案时先读原文；`via=panel` 是边栏里点的 |
-| `citation_panel_toggle` | 宽屏（≥1280px）引文边栏收起 / 展开 | `state`=`collapsed`/`expanded`；收起状态记在 localStorage |
+| `source_click` | 点「参考经文」chip / 等待期 chip / 定位卡片 / 边栏里的参考经文 | `phase=retrieved` 是等答案时先读原文；`phase=locate` 是定位卡片；`via=panel` 是边栏里点的 |
+| `citation_panel_open` | 引文边栏从**收起变展开**（已开着时再点不记） | `via`=`chip`（回答下方入口胶囊「N 处出处 · 已逐字核验 M 条 ›」）/`inline`（收起时点正文内联引文，直接进原文对照）/`source`（收起时点参考经文 / 定位卡片）。只有 `chip` 的展开在宽屏（≥1280px）记进 localStorage `fojin-citation-sidebar-open`，下次进页默认展开；窄屏不记 |
+| `citation_panel_close` | 点边栏右上角 ×（列表视图或原文对照视图）| `view`=`list`/`passage`；宽屏记住「收起」 |
+| ~~`citation_panel_toggle`~~ | #1344 常驻模式的收起 / 展开竖条，入口胶囊模式下已移除 | 只存在于 2026-10-16 当天的旧数据 |
 | `chat_copy` | 复制回答 | 有用信号 |
+
+⚠️ `citation_panel_open` **不进核对率**：打开列表不等于点开了原文。核对率仍只数 `citation_click` + `source_click`。
+
+### 引文边栏的杀死条件（入口胶囊模式）
+
+右栏默认收起、靠回答下方的入口胶囊按需展开（DeepSeek 式）。**入口胶囊模式上线 30 天，核对率不回 8% 以上，考虑恢复默认展开（#1344 的常驻模式）。**
+
+- **比较对象**：上线日起 30 天的核对率（访客口径，见下表），对比 #1344 上线前 30 天（2026-09-16 ~ 10-15，同口径；10-12 体检量到的近期值是 4.7%，历史高点 11.3%）。#1344 常驻模式只跑了不到一天，样本太小，不作对照组。
+- 同时看漏斗，判断「没回升」是入口没人点还是点了不看：`citation_panel_open{via=chip}` 访客 ÷ `chat` 访客（入口触达），`citation_click{via=panel}` + `source_click{via=panel}` ÷ `citation_panel_open`（打开后真去核对）。
+- 查 Umami 必须按 `website_id` 过滤（同一实例还托管别的站）。
 
 ## 四个 KPI
 
