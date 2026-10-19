@@ -70,3 +70,23 @@ export function trackSourceClick(
   if (typeof window === "undefined" || !window.umami) return;
   window.umami.track("source_click", { code, kind, ...extra });
 }
+
+// 「常用数据源」：手机上分组默认收起，首屏一张数据源都看不到；这里把编辑认为最常用的
+// 12 个站做成紧凑链接放在页首。⚠️名单**不能**说成「读者点击排行」：2026-10-19 复核
+// 发现点击主要由位置决定——默认页最前 12 张卡拿走 38% 点击（人均 32 次），组内第 13
+// 位以后的 381 个源人均 0.5 次，所以点击数基本复述了 sort_order。名单 = 编辑精选，
+// 参考了点击但不以它为准；每季度复核一次。
+export const FEATURED_SOURCE_CODES = [
+  "books-fo",
+  "cbeta-archive",
+  "fanfoyan-dict",
+  "cbeta",
+  "yuezang",
+  "dianjin",
+  "shidianguji",
+  "xuefo",
+  "cbeta-tripitaka",
+  "foyan",
+  "84000",
+  "dunhuang-iiif",
+] as const;
