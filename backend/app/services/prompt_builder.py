@@ -117,6 +117,30 @@ def card_llm_message(template: str) -> str:
     """卡片模板 → 发给 LLM 的最后一轮用户消息（模板 + 作答提示）。"""
     return template + CARD_THINKING_TAIL
 
+
+# 界面语言目标表：代码来自前端 SUPPORTED_UI_LANGS，经 ChatRequest.ui_lang 传入。
+# 后端不知道用户界面语言时（旧前端 / 未传参），规则 6 的「使用用户的语言回答」
+# 会让模型按上下文主体字形作答——阅读器模式下页面经文与检索片段都是繁体，
+# 简体用户就会收到繁体回答。未知代码返回空串，系统提示词保持原样。
+_UI_LANGUAGE_TARGETS = {
+    "zh": "简体中文",
+    "zh-Hant": "繁體中文",
+    "en": "英语（English）",
+}
+
+
+def _ui_language_suffix(ui_lang: str) -> str:
+    target = _UI_LANGUAGE_TARGETS.get(ui_lang)
+    if target is None:
+        return ""
+    return (
+        "\n\n## 界面语言\n"
+        f"用户当前界面语言为{target}。回答正文、白话翻译、术语解释和文末的[追问]建议，"
+        f"一律使用{target}书写；"
+        "但逐字引用经文原文时保持其原始字形（通常为繁体），不得转写、翻译引文本身；"
+        "【《经名》第N卷】引用中的经名保持[出处]行的原始写法（通常为繁体）。"
+    )
+
 META_INTRO_PROMPT = (
     "你是小津（XiaoJin）——佛津（FoJin）平台内置的佛教古籍研习 AI 助手。\n\n"
     "当用户询问你是谁、你能做什么、请你自我介绍时，严格按以下格式回复，"
@@ -323,6 +347,7 @@ def _build_llm_messages(
     master_id: str | None = None,
     reading_context: dict | None = None,
     llm_message_override: str | None = None,
+    ui_lang: str | None = None,
 ) -> list[dict[str, str]]:
     """Build the message list for the LLM call, trimming if too long.
 
@@ -330,6 +355,12 @@ def _build_llm_messages(
     final user turn sent to the LLM. The caller keeps ``message`` as the
     user-visible question (used for RAG, history, titles), while the
     override carries the expanded prompt template for richer guidance.
+
+    ``ui_lang`` (zh / zh-Hant / en) appends a language directive at the very
+    end of the system prompt so the answer body follows the user's UI
+    language; scripture quotes and citation titles keep their original
+    script (rules 4/4c). Unknown codes are ignored — callers that don't
+    send it get the byte-identical prompt the citation evals pinned.
     """
     master = get_master(master_id) if master_id else None
     if master:
@@ -364,6 +395,10 @@ def _build_llm_messages(
             reading_context.get("selected_text"),
             reading_context.get("page_content"),
         )
+    if ui_lang:
+        # 放在最末尾：离生成最近的指令服从率最高（与两个 eval 后缀同一逻辑），
+        # 且不改动它们的逐字文本。未知 ui_lang 返回空串，等于不加。
+        enhanced_prompt += _ui_language_suffix(ui_lang)
     llm_messages: list[dict[str, str]] = [{"role": "system", "content": enhanced_prompt}]
     budget = _MAX_INPUT_TOKENS - _estimate_tokens(enhanced_prompt) - _estimate_tokens(reader_data_block)
 
