@@ -118,14 +118,13 @@ def card_llm_message(template: str) -> str:
     return template + CARD_THINKING_TAIL
 
 
-# 界面语言目标表：代码来自前端 SUPPORTED_UI_LANGS，经 ChatRequest.ui_lang 传入。
-# 后端不知道用户界面语言时（旧前端 / 未传参），规则 6 的「使用用户的语言回答」
-# 会让模型按上下文主体字形作答——阅读器模式下页面经文与检索片段都是繁体，
-# 简体用户就会收到繁体回答。未知代码返回空串，系统提示词保持原样。
+# 中文作答字形表：ui_lang 只决定「回答为中文时用简体还是繁体」，不决定回答语言——
+# 后者仍跟提问走（规则 6）。维护者反馈（PR #1376）：不少中文读者的浏览器默认英文界面
+#（见 #1340），若按界面语言强制作答语言，这些人用中文提问会被要求英文作答，与规则 6
+# 冲突。en 因此不加任何后缀；未知代码返回空串，系统提示词保持原样。
 _UI_LANGUAGE_TARGETS = {
     "zh": "简体中文",
     "zh-Hant": "繁體中文",
-    "en": "英语（English）",
 }
 
 
@@ -134,10 +133,10 @@ def _ui_language_suffix(ui_lang: str) -> str:
     if target is None:
         return ""
     return (
-        "\n\n## 界面语言\n"
-        f"用户当前界面语言为{target}。回答正文、白话翻译、术语解释和文末的[追问]建议，"
-        f"一律使用{target}书写；"
-        "但逐字引用经文原文时保持其原始字形（通常为繁体），不得转写、翻译引文本身；"
+        "\n\n## 中文作答的字形\n"
+        f"当回答使用中文时（含正文、白话翻译、术语解释和文末的[追问]建议），一律使用{target}书写；"
+        "用哪种语言作答仍跟随用户的提问（规则 6），本指令仅在回答为中文时约束简/繁。"
+        "逐字引用经文原文时保持其原始字形（通常为繁体），不得转写、翻译引文本身；"
         "【《经名》第N卷】引用中的经名保持[出处]行的原始写法（通常为繁体）。"
     )
 
@@ -356,11 +355,13 @@ def _build_llm_messages(
     user-visible question (used for RAG, history, titles), while the
     override carries the expanded prompt template for richer guidance.
 
-    ``ui_lang`` (zh / zh-Hant / en) appends a language directive at the very
-    end of the system prompt so the answer body follows the user's UI
-    language; scripture quotes and citation titles keep their original
-    script (rules 4/4c). Unknown codes are ignored — callers that don't
-    send it get the byte-identical prompt the citation evals pinned.
+    ``ui_lang`` (zh / zh-Hant) appends a script directive at the very end of
+    the system prompt: when the answer is in Chinese, write it in that
+    script. The answer *language* still follows the question (rule 6) —
+    English UI users asking in Chinese get Chinese answers, only the
+    简/繁 of Chinese answers is pinned. ``en`` and unknown codes get no
+    directive — callers that don't send ``ui_lang`` get the byte-identical
+    prompt the citation evals pinned.
     """
     master = get_master(master_id) if master_id else None
     if master:
@@ -397,7 +398,7 @@ def _build_llm_messages(
         )
     if ui_lang:
         # 放在最末尾：离生成最近的指令服从率最高（与两个 eval 后缀同一逻辑），
-        # 且不改动它们的逐字文本。未知 ui_lang 返回空串，等于不加。
+        # 且不改动它们的逐字文本。en 与未知 ui_lang 返回空串，等于不加。
         enhanced_prompt += _ui_language_suffix(ui_lang)
     llm_messages: list[dict[str, str]] = [{"role": "system", "content": enhanced_prompt}]
     budget = _MAX_INPUT_TOKENS - _estimate_tokens(enhanced_prompt) - _estimate_tokens(reader_data_block)
